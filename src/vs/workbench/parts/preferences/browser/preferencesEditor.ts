@@ -21,7 +21,7 @@ import { Registry } from 'vs/platform/platform';
 import { toResource, SideBySideEditorInput, EditorOptions, EditorInput, IEditorRegistry, Extensions as EditorExtensions } from 'vs/workbench/common/editor';
 import { BaseEditor, EditorDescriptor } from 'vs/workbench/browser/parts/editor/baseEditor';
 import { ResourceEditorModel } from 'vs/workbench/common/editor/resourceEditorModel';
-import { IEditorControl, IEditor } from 'vs/platform/editor/common/editor';
+import { IEditorControl, IEditor, IEditorModel } from 'vs/platform/editor/common/editor';
 import { ResourceEditorInput } from 'vs/workbench/common/editor/resourceEditorInput';
 import { IConfigurationRegistry, Extensions as ConfigurationExtensions } from 'vs/platform/configuration/common/configurationRegistry';
 import * as editorCommon from 'vs/editor/common/editorCommon';
@@ -30,8 +30,7 @@ import { CodeEditor } from 'vs/editor/browser/codeEditor';
 import { Range } from 'vs/editor/common/core/range';
 import { IInstantiationService, ServicesAccessor } from 'vs/platform/instantiation/common/instantiation';
 import {
-	IPreferencesService, ISettingsGroup, ISetting, IPreferencesEditorModel, IFilterResult, CONTEXT_DEFAULT_SETTINGS_EDITOR,
-	DEFAULT_EDITOR_COMMAND_COLLAPSE_ALL, DEFAULT_EDITOR_COMMAND_FOCUS_SEARCH, ISettingsEditorModel
+	IPreferencesService, ISettingsGroup, ISetting, IPreferencesEditorModel, IFilterResult, CONTEXT_DEFAULT_SETTINGS_EDITOR, ISettingsEditorModel
 } from 'vs/workbench/parts/preferences/common/preferences';
 import { SettingsEditorModel, DefaultSettingsEditorModel } from 'vs/workbench/parts/preferences/common/preferencesModels';
 import { editorContribution } from 'vs/editor/browser/editorBrowserExtensions';
@@ -39,7 +38,7 @@ import { ICodeEditor, IEditorMouseEvent, IEditorContributionCtor } from 'vs/edit
 import { IContextMenuService, ContextSubMenu } from 'vs/platform/contextview/browser/contextView';
 import { SearchWidget, SettingsTabsWidget, SettingsGroupTitleWidget, EditPreferenceWidget } from 'vs/workbench/parts/preferences/browser/preferencesWidgets';
 import { IContextKeyService, IContextKey, ContextKeyExpr } from 'vs/platform/contextkey/common/contextkey';
-import { CommonEditorRegistry, EditorCommand, Command } from 'vs/editor/common/editorCommonExtensions';
+import { CommonEditorRegistry, Command } from 'vs/editor/common/editorCommonExtensions';
 import { ITelemetryService } from 'vs/platform/telemetry/common/telemetry';
 import { IThemeService } from 'vs/workbench/services/themes/common/themeService';
 import { IModelService } from 'vs/editor/common/services/modelService';
@@ -333,11 +332,11 @@ class SideBySidePreferencesWidget extends Widget {
 		return this.getOrCreateEditablePreferencesEditor(editablePreferencesEditorInput)
 			.then(() => {
 				this.dolayout(this.sash.getVerticalSashLeft());
-				return TPromise.join([this.defaultPreferencesEditor.updateInput(defaultPreferencesEditorInput, options, toResource(editablePreferencesEditorInput)),
+				return TPromise.join([this.defaultPreferencesEditor.setInput(defaultPreferencesEditorInput, options),
 				this.editablePreferencesEditor.setInput(editablePreferencesEditorInput, options)])
 					.then(() => {
 						return {
-							defaultPreferencesRenderer: (<CodeEditor>this.defaultPreferencesEditor.getControl()).getContribution<DefaultSettingsEditorContribution>(DefaultSettingsEditorContribution.ID).getPreferencesRenderer(),
+							defaultPreferencesRenderer: this.defaultPreferencesEditor.getPreferencesRenderer(),
 							editablePreferencesRenderer: (<CodeEditor>this.editablePreferencesEditor.getControl()).getContribution<SettingsEditorContribution>(SettingsEditorContribution.ID).getPreferencesRenderer()
 						};
 					});
@@ -423,6 +422,7 @@ class SideBySidePreferencesWidget extends Widget {
 export class DefaultPreferencesEditor extends BaseTextEditor {
 
 	public static ID: string = 'workbench.editor.defaultPreferences';
+	private defaultPreferencesRenderer: IPreferencesRenderer<ISetting>;
 
 	constructor(
 		@ITelemetryService telemetryService: ITelemetryService,
@@ -460,14 +460,36 @@ export class DefaultPreferencesEditor extends BaseTextEditor {
 		return options;
 	}
 
-	updateInput(input: DefaultPreferencesEditorInput, options: EditorOptions, editablePreferencesUri: URI): TPromise<void> {
-		return this.setInput(input, options)
-			.then(() => this.input.resolve()
-				.then(editorModel => TPromise.join<any>([
-					editorModel.load(),
-					this.preferencesService.resolvePreferencesEditorModel(editablePreferencesUri)
-				]))
-				.then(([editorModel, preferencesModel]) => (<DefaultPreferencesCodeEditor>this.getControl()).setModels((<ResourceEditorModel>editorModel).textEditorModel, <SettingsEditorModel>preferencesModel)));
+	setInput(input: DefaultPreferencesEditorInput, options: EditorOptions): TPromise<void> {
+		if (this.input && this.input.matches(input)) {
+			return TPromise.as(null);
+		}
+		return super.setInput(input, options).then(() => this.setModel());
+	}
+
+	getPreferencesRenderer(): IPreferencesRenderer<ISetting> {
+		return this.defaultPreferencesRenderer;
+	}
+
+	private setModel(): TPromise<void> {
+		if (this.defaultPreferencesRenderer) {
+			this.defaultPreferencesRenderer.dispose();
+		}
+		return TPromise.join<any>([this.loadEditorModel(), this.resolvePreferencesModel()])
+			.then(([editorModel, defaultPreferencesModel]) => {
+				const editor = (<DefaultPreferencesCodeEditor>this.getControl());
+				editor.setModel((<ResourceEditorModel>editorModel).textEditorModel);
+				this.defaultPreferencesRenderer = this.instantiationService.createInstance(DefaultSettingsRenderer, editor, defaultPreferencesModel);
+				this.defaultPreferencesRenderer.render();
+			});
+	}
+
+	private loadEditorModel(): TPromise<IEditorModel> {
+		return this.input.resolve().then(editorModel => editorModel.load());
+	}
+
+	private resolvePreferencesModel(): TPromise<IPreferencesEditorModel<ISetting>> {
+		return this.preferencesService.resolvePreferencesEditorModel<ISetting>((<DefaultPreferencesEditorInput>this.input).getResource());
 	}
 
 	public layout(dimension: Dimension) {
@@ -492,7 +514,6 @@ class DefaultPreferencesCodeEditor extends CodeEditor {
 		let contributions = super._getContributions();
 		let skipContributions = [FoldingController.prototype, SelectionHighlighter.prototype, FindController.prototype];
 		contributions = contributions.filter(c => skipContributions.indexOf(c.prototype) === -1);
-		contributions.push(DefaultSettingsEditorContribution);
 		return contributions;
 	}
 
@@ -564,22 +585,6 @@ export abstract class PreferencesEditorContribution<T> extends Disposable implem
 	public dispose() {
 		this.disposePreferencesRenderer();
 		super.dispose();
-	}
-}
-
-export class DefaultSettingsEditorContribution extends PreferencesEditorContribution<ISetting> implements editorCommon.IEditorContribution {
-
-	static ID: string = 'editor.contrib.defaultsettings';
-
-	protected createPreferencesRenderer(editorModel: IPreferencesEditorModel<ISetting>): IPreferencesRenderer<ISetting> {
-		if (editorModel instanceof DefaultSettingsEditorModel) {
-			return this.instantiationService.createInstance(DefaultSettingsRenderer, this.editor, editorModel);
-		}
-		return null;
-	}
-
-	getId(): string {
-		return DefaultSettingsEditorContribution.ID;
 	}
 }
 
@@ -1452,14 +1457,6 @@ class UnTrustedWorkspaceSettingsRenderer extends Disposable {
 		super.dispose();
 	}
 }
-
-const DefaultSettingsEditorCommand = EditorCommand.bindToContribution<PreferencesEditorContribution<ISetting>>((editor: editorCommon.ICommonCodeEditor) => <PreferencesEditorContribution<ISetting>>editor.getContribution(DefaultSettingsEditorContribution.ID));
-
-CommonEditorRegistry.registerEditorCommand(new DefaultSettingsEditorCommand({
-	id: DEFAULT_EDITOR_COMMAND_COLLAPSE_ALL,
-	precondition: ContextKeyExpr.and(CONTEXT_DEFAULT_SETTINGS_EDITOR),
-	handler: x => (<DefaultSettingsRenderer>x.getPreferencesRenderer()).collapseAll()
-}));
 
 class StartSearchDefaultSettingsCommand extends Command {
 
